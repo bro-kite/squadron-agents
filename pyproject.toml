@@ -1,0 +1,202 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "squadron-agent"
+version = "0.1.0"
+description = "Squadron Agent Framework - Inference-Time Compute over Pre-Training Scale"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Squadron Team" }
+]
+keywords = [
+    "ai",
+    "agents",
+    "llm",
+    "reasoning",
+    "mcts",
+    "langgraph",
+    "mcp",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # L0: Runtime - LangGraph
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "langchain-anthropic>=0.2.0",
+    
+    # L1: Memory - Graphiti (optional, falls back to in-memory)
+    # "graphiti-core>=0.3.0",  # Optional: pip install squadron-agent[graphiti]
+    # "neo4j>=5.0.0",
+    
+    # L2: Cognition - Reasoning support
+    "numpy>=1.26.0",
+    
+    # L3: Connectivity - MCP & A2A
+    "httpx>=0.27.0",
+    "aiohttp>=3.9.0",
+    
+    # L4: Governance - Evaluation (optional)
+    # "deepeval>=1.0.0",  # Optional: pip install squadron-agent[eval]
+    
+    # L5: Evolution - Sandbox support
+    # Docker is optional for sandboxing
+    
+    # Core utilities
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.0.0",
+    "rich>=13.0.0",
+    "typer>=0.12.0",
+    "tenacity>=9.0.0",
+    "aiofiles>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0.0",
+    "pytest-mock>=3.14.0",
+    "mypy>=1.11.0",
+    "ruff>=0.7.0",
+    "pre-commit>=4.0.0",
+    "ipython>=8.0.0",
+]
+
+# L1: Graphiti memory with Neo4j
+graphiti = [
+    "graphiti-core>=0.3.0",
+    "neo4j>=5.0.0",
+]
+
+# L3: MCP server support
+mcp = [
+    "mcp>=1.0.0",
+]
+
+# L3: A2A server support
+server = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "websockets>=13.0",
+]
+
+# L4: Evaluation support
+eval = [
+    "deepeval>=1.0.0",
+    "ragas>=0.2.0",
+]
+
+# L5: Sandbox support
+sandbox = [
+    "docker>=7.0.0",
+]
+
+# Research tools extras
+research = [
+    "beautifulsoup4>=4.12.0",
+]
+
+# Ops tools extras
+ops = [
+    "psutil>=6.0.0",
+]
+
+# All optional dependencies
+all = [
+    "squadron-agent[graphiti,mcp,server,eval,sandbox,research,ops]",
+]
+
+[project.scripts]
+squadron = "squadron.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/squadron-agent/squadron"
+Documentation = "https://squadron-agent.github.io/docs"
+Repository = "https://github.com/squadron-agent/squadron"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/squadron"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["squadron"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "langgraph.*",
+    "langchain.*",
+    "graphiti.*",
+    "neo4j.*",
+    "deepeval.*",
+    "ragas.*",
+    "mcp.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "slow: Slow tests",
+    "sandbox: Tests requiring Docker sandbox",
+]
+
+[tool.coverage.run]
+source = ["src/squadron"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
