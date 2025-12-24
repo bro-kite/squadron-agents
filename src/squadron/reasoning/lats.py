@@ -402,11 +402,288 @@ class LATSReasoner:
     def set_llm(self, llm: LLMProvider) -> None:
         """Set the LLM provider for action generation."""
         self.llm = llm
+        # Reinitialize MCTS with real functions now that we have an LLM
+        self._init_mcts_with_llm()
         logger.info("Set LLM provider for LATS", provider=llm.provider_name)
 
-    # MCTS placeholders (to be expanded with real rollout logic)
-    def _expand_stub(self, state: Any):
+    def _init_mcts_with_llm(self) -> None:
+        """Initialize MCTS controller with LLM-based expand and simulate functions."""
+        self.mcts = MCTSController(
+            expand_fn=self._mcts_expand,
+            simulate_fn=self._mcts_simulate,
+            is_terminal_fn=self._mcts_is_terminal,
+            exploration_constant=self.config.exploration_constant,
+            max_depth=self.config.max_depth,
+        )
+
+    # ------------------------------------------------------------------
+    # MCTS Integration
+    # ------------------------------------------------------------------
+    async def plan_with_mcts(
+        self,
+        state: AgentState,
+        budget: int | None = None,
+    ) -> AgentState:
+        """
+        Plan using full MCTS tree search.
+
+        This method uses Monte Carlo Tree Search to explore multiple
+        action trajectories and select the best one.
+
+        Args:
+            state: Current agent state
+            budget: Number of MCTS simulations (defaults to config.simulation_budget)
+
+        Returns:
+            Updated agent state with chosen action
+        """
+        if not self.llm:
+            logger.warning("MCTS planning requires LLM, falling back to simple plan")
+            return await self.plan(state)
+
+        budget = budget or self.config.simulation_budget
+
+        logger.info("Starting MCTS planning", budget=budget)
+
+        # Run MCTS search
+        best_action, trajectory = await self.mcts.search(
+            initial_state=state,
+            budget=budget,
+        )
+
+        if best_action is None:
+            logger.warning("MCTS found no valid actions, falling back to simple plan")
+            return await self.plan(state)
+
+        # Extract the tool call from the best action
+        tool_call = ToolCall(
+            id=uuid4(),
+            tool_name=best_action["tool_name"],
+            arguments=best_action.get("arguments", {}),
+        )
+
+        # Build planning message with trajectory info
+        trajectory_desc = " -> ".join(
+            node.action_description for node in trajectory if node.action_description
+        )
+
+        plan_msg = Message(
+            role=MessageRole.ASSISTANT,
+            content=f"MCTS planning selected: {tool_call.tool_name}\nTrajectory: {trajectory_desc}",
+            metadata={
+                "phase": "planning",
+                "mcts_budget": budget,
+                "trajectory_length": len(trajectory),
+                "tree_stats": self.mcts.tree_stats,
+            },
+        )
+
+        state = state.add_message(plan_msg)
+        state = state.add_tool_call(tool_call)
+
+        logger.info(
+            "MCTS planning complete",
+            action=tool_call.tool_name,
+            tree_stats=self.mcts.tree_stats,
+        )
+
+        return state
+
+    def _mcts_expand(self, state: AgentState) -> list[tuple[Any, str, AgentState]]:
+        """
+        MCTS expansion function: Generate possible actions from a state.
+
+        This is called synchronously by MCTS, so we use a synchronous
+        approach to generate candidates.
+
+        Returns:
+            List of (action_dict, description, new_state) tuples
+        """
+        import asyncio
+
+        if not self.llm or not self.tools:
+            return []
+
+        try:
+            # Run async candidate generation synchronously
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Already in async context, use thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self._generate_mcts_expansions(state),
+                    )
+                    return future.result(timeout=30)
+            else:
+                return loop.run_until_complete(
+                    self._generate_mcts_expansions(state)
+                )
+        except Exception as e:
+            logger.error("MCTS expansion failed", error=str(e))
+            return []
+
+    async def _generate_mcts_expansions(
+        self, state: AgentState
+    ) -> list[tuple[Any, str, AgentState]]:
+        """Generate expansion candidates for MCTS."""
+        candidates = await self._generate_candidate_calls_llm(state)
+
+        expansions = []
+        for candidate in candidates:
+            # Create action dict
+            action = {
+                "tool_name": candidate.action,
+                "arguments": candidate.context.get("arguments", {}),
+                "thought": candidate.thought,
+            }
+
+            # Create a hypothetical next state (without actually executing)
+            # This represents what we expect the state to look like
+            tool_call = ToolCall(
+                id=uuid4(),
+                tool_name=candidate.action,
+                arguments=candidate.context.get("arguments", {}),
+            )
+
+            new_state = state.add_tool_call(tool_call)
+            new_state = new_state.add_message(
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content=f"Hypothetical: {candidate.expected_outcome}",
+                    metadata={"mcts_hypothetical": True},
+                )
+            )
+
+            description = f"{candidate.action}: {candidate.thought[:50]}"
+            expansions.append((action, description, new_state))
+
+        return expansions
+
+    def _mcts_simulate(self, state: AgentState) -> float:
+        """
+        MCTS simulation function: Evaluate the quality of a state.
+
+        Returns a value in [0, 1] representing how promising this state is.
+        """
+        import asyncio
+
+        if not self.llm:
+            return self._heuristic_state_value(state)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Already in async context, use heuristic
+                return self._heuristic_state_value(state)
+            else:
+                return loop.run_until_complete(
+                    self._llm_state_value(state)
+                )
+        except Exception as e:
+            logger.error("MCTS simulation failed", error=str(e))
+            return self._heuristic_state_value(state)
+
+    async def _llm_state_value(self, state: AgentState) -> float:
+        """Use LLM to evaluate state quality."""
+        prompt = f"""Evaluate the following agent state on a scale of 0.0 to 1.0.
+
+Task: {state.task}
+
+Current Progress:
+- Messages: {len(state.messages)}
+- Tool calls executed: {len(state.tool_results)}
+- Successful tools: {sum(1 for r in state.tool_results if r.success)}
+- Current phase: {state.phase}
+
+Recent activity:
+{self._format_history(state)}
+
+How close is this state to completing the task successfully?
+Respond with ONLY a number between 0.0 and 1.0."""
+
+        try:
+            messages = [LLMMessage.user(prompt)]
+            response = await self.llm.generate(messages)
+
+            # Parse the value
+            content = response.content.strip()
+            # Extract first number found
+            import re
+            match = re.search(r"([0-9]*\.?[0-9]+)", content)
+            if match:
+                value = float(match.group(1))
+                return max(0.0, min(1.0, value))
+
+            return 0.5  # Default to middle value
+
+        except Exception as e:
+            logger.error("LLM state evaluation failed", error=str(e))
+            return self._heuristic_state_value(state)
+
+    def _heuristic_state_value(self, state: AgentState) -> float:
+        """
+        Heuristic state evaluation when LLM is unavailable.
+
+        Scores based on:
+        - Progress (number of successful tool calls)
+        - Recency of success
+        - Absence of errors
+        """
+        value = 0.0
+
+        # Base value for having tool results
+        if state.tool_results:
+            value += 0.2
+
+        # Bonus for successful tool calls
+        successful = sum(1 for r in state.tool_results if r.success)
+        total = len(state.tool_results)
+        if total > 0:
+            success_rate = successful / total
+            value += 0.3 * success_rate
+
+        # Bonus for recent success
+        if state.tool_results and state.tool_results[-1].success:
+            value += 0.2
+
+        # Penalty for errors
+        if state.errors:
+            value -= 0.3
+
+        # Bonus for completion indicators in messages
+        completion_keywords = ["complete", "done", "finished", "success"]
+        for msg in state.messages[-3:]:
+            if any(kw in msg.content.lower() for kw in completion_keywords):
+                value += 0.2
+                break
+
+        return max(0.0, min(1.0, value))
+
+    def _mcts_is_terminal(self, state: AgentState) -> bool:
+        """Check if a state is terminal (task complete or failed)."""
+        # Terminal if completed or errored
+        if state.phase.value in ("completed", "error"):
+            return True
+
+        # Terminal if max iterations reached
+        if state.iteration >= state.max_iterations:
+            return True
+
+        # Terminal if we have completion indicators
+        completion_keywords = ["complete", "done", "finished", "success"]
+        for msg in state.messages[-2:]:
+            if any(kw in msg.content.lower() for kw in completion_keywords):
+                return True
+
+        return False
+
+    # Legacy stub methods (kept for backward compatibility)
+    def _expand_stub(self, state: Any) -> list:
+        """Stub expand function for when LLM is not available."""
         return []
 
     def _simulate_stub(self, state: Any) -> float:
+        """Stub simulate function for when LLM is not available."""
         return 0.0
