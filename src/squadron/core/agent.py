@@ -6,8 +6,11 @@ Implements the cyclic Plan → Act → Reflect loop.
 
 Security: Includes rate limiting on tool execution to prevent
 resource exhaustion and data exfiltration attacks.
+
+Enhanced with LLM-based task completion detection for accurate evaluation.
 """
 
+import json
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -27,8 +30,41 @@ from squadron.core.state import (
     ToolCall,
     ToolResult,
 )
+from squadron.llm.base import LLMProvider, LLMMessage
 
 logger = structlog.get_logger(__name__)
+
+
+# Prompt template for LLM-based task completion detection
+COMPLETION_DETECTION_PROMPT = '''You are an expert task completion evaluator. Analyze whether the given task has been successfully completed based on the conversation history and tool results.
+
+## Task
+{task}
+
+## Conversation History
+{history}
+
+## Tool Results Summary
+{tool_results}
+
+## Instructions
+Carefully analyze the evidence to determine if the task has been completed. Consider:
+1. Was the main objective of the task achieved?
+2. Are all required sub-tasks finished?
+3. Were the tool executions successful?
+4. Is there any indication the task is incomplete or failed?
+
+## Output Format
+Respond with a JSON object:
+```json
+{{
+    "completed": true/false,
+    "confidence": 0.0-1.0,
+    "reason": "Brief explanation of your assessment"
+}}
+```
+
+Your assessment:'''
 
 
 # Security: Default rate limits for tool execution
@@ -68,29 +104,35 @@ class Agent:
         self,
         name: str,
         config: SquadronConfig | None = None,
+        llm: LLMProvider | None = None,
         memory: Any | None = None,  # GraphitiMemory
         reasoner: Any | None = None,  # LATSReasoner
         tools: list[Any] | None = None,
         checkpointer: Any | None = None,
+        completion_confidence_threshold: float = 0.7,
     ):
         """
         Initialize the agent.
-        
+
         Args:
             name: Agent identifier
             config: Configuration object
+            llm: LLM provider for completion detection and other evaluations
             memory: Memory system (Graphiti)
             reasoner: Reasoning engine (LATS)
             tools: Available tools
             checkpointer: LangGraph checkpointer for persistence
+            completion_confidence_threshold: Minimum confidence for LLM completion detection
         """
         self.name = name
         self.config = config or SquadronConfig()
+        self.llm = llm
         self.memory = memory
         self.reasoner = reasoner
         self.tools = tools or []
         self.checkpointer = checkpointer or MemorySaver()
-        
+        self.completion_confidence_threshold = completion_confidence_threshold
+
         # Tool registry for quick lookup
         self._tool_registry: dict[str, Callable] = {}
         for tool in self.tools:
@@ -105,11 +147,12 @@ class Agent:
 
         # Build the execution graph
         self._graph = self._build_graph()
-        
+
         logger.info(
             "Agent initialized",
             name=self.name,
             tools=list(self._tool_registry.keys()),
+            has_llm=self.llm is not None,
         )
 
     def _build_graph(self) -> Any:
@@ -387,23 +430,152 @@ class Agent:
     def _is_task_complete(self, state: AgentState) -> bool:
         """
         Determine if the task is complete.
-        
-        This is a simplified heuristic. Real implementation would
-        use LLM-based evaluation.
+
+        Uses LLM-based evaluation when available, with fallback to heuristics.
         """
         # Check if we have any successful tool results
         if not state.tool_results:
             return False
-        
+
+        # Try LLM-based detection if available
+        if self.llm:
+            import asyncio
+            try:
+                # Run async method in sync context
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're already in an async context, use the sync fallback
+                    return self._is_task_complete_heuristic(state)
+                return loop.run_until_complete(
+                    self._is_task_complete_llm(state)
+                )
+            except RuntimeError:
+                # No event loop, create one
+                return asyncio.run(self._is_task_complete_llm(state))
+            except Exception as e:
+                logger.warning(
+                    "LLM completion detection failed, using heuristic",
+                    error=str(e),
+                )
+                return self._is_task_complete_heuristic(state)
+
+        return self._is_task_complete_heuristic(state)
+
+    async def _is_task_complete_llm(self, state: AgentState) -> bool:
+        """
+        Use LLM to determine if the task is complete.
+
+        Returns True if the LLM determines the task is complete with
+        sufficient confidence.
+        """
+        # Format conversation history
+        history_lines = []
+        for msg in state.messages[-15:]:  # Last 15 messages
+            role = msg.role.value.upper()
+            content = msg.content[:300]
+            if len(msg.content) > 300:
+                content += "..."
+            history_lines.append(f"[{role}]: {content}")
+        history_text = "\n".join(history_lines) if history_lines else "No messages."
+
+        # Format tool results
+        tool_results_lines = []
+        for result in state.tool_results[-10:]:  # Last 10 results
+            status = "SUCCESS" if result.success else "FAILED"
+            result_preview = str(result.result)[:200] if result.result else ""
+            error_text = f" Error: {result.error}" if result.error else ""
+            tool_results_lines.append(
+                f"- {result.tool_name}: {status}{error_text}"
+                f"{(' -> ' + result_preview) if result_preview else ''}"
+            )
+        tool_results_text = (
+            "\n".join(tool_results_lines) if tool_results_lines else "No tool results."
+        )
+
+        # Build the prompt
+        prompt = COMPLETION_DETECTION_PROMPT.format(
+            task=state.task,
+            history=history_text,
+            tool_results=tool_results_text,
+        )
+
+        try:
+            messages = [LLMMessage.user(prompt)]
+            response = await self.llm.generate(messages)
+
+            # Parse the response
+            result = self._parse_completion_response(response.content)
+
+            completed = result.get("completed", False)
+            confidence = result.get("confidence", 0.0)
+            reason = result.get("reason", "")
+
+            logger.info(
+                "LLM completion detection result",
+                completed=completed,
+                confidence=confidence,
+                reason=reason[:100] if reason else None,
+            )
+
+            # Only mark as complete if confidence exceeds threshold
+            if completed and confidence >= self.completion_confidence_threshold:
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error("LLM completion detection error", error=str(e))
+            return self._is_task_complete_heuristic(state)
+
+    def _parse_completion_response(self, content: str) -> dict[str, Any]:
+        """Parse the LLM completion detection response."""
+        try:
+            # Find JSON in response
+            json_start = content.find("{")
+            json_end = content.rfind("}") + 1
+
+            if json_start >= 0 and json_end > json_start:
+                json_str = content[json_start:json_end]
+                return json.loads(json_str)
+
+            logger.warning("No JSON found in completion response")
+            return {"completed": False, "confidence": 0.0}
+
+        except json.JSONDecodeError as e:
+            logger.warning("Failed to parse completion JSON", error=str(e))
+            return {"completed": False, "confidence": 0.0}
+
+    def _is_task_complete_heuristic(self, state: AgentState) -> bool:
+        """
+        Fallback heuristic-based completion detection.
+
+        Uses keyword matching when LLM is not available.
+        """
+        # Check if we have any successful tool results
+        if not state.tool_results:
+            return False
+
         # Check recent messages for completion indicators
         recent_messages = state.messages[-3:] if state.messages else []
-        completion_keywords = ["complete", "done", "finished", "success"]
-        
+        completion_keywords = ["complete", "done", "finished", "success", "completed"]
+
         for msg in recent_messages:
             if any(kw in msg.content.lower() for kw in completion_keywords):
                 return True
-        
+
+        # Check if all recent tool calls succeeded
+        recent_results = state.tool_results[-3:] if len(state.tool_results) >= 3 else state.tool_results
+        if all(r.success for r in recent_results):
+            # Multiple successful tool calls might indicate completion
+            if len(recent_results) >= 2:
+                return True
+
         return False
+
+    def set_llm(self, llm: LLMProvider) -> None:
+        """Set the LLM provider for the agent."""
+        self.llm = llm
+        logger.info("Set LLM provider for agent", provider=llm.provider_name)
 
     async def run(
         self,
@@ -460,25 +632,183 @@ class Agent:
         self,
         session_id: UUID,
         approval: bool = True,
+        user_input: str | None = None,
     ) -> AgentState:
         """
         Resume a paused agent execution.
-        
-        Used after human-in-the-loop approval.
-        
+
+        Used after human-in-the-loop approval or to continue from a checkpoint.
+
         Args:
             session_id: Session to resume
-            approval: Whether the action was approved
-            
+            approval: Whether the pending action was approved
+            user_input: Optional additional input from the user
+
         Returns:
             Final agent state after resumption
         """
-        logger.info("Resuming agent", session_id=str(session_id), approval=approval)
-        
-        # Get the checkpointed state
-        # This would retrieve from the checkpointer
-        # For now, this is a placeholder
-        raise NotImplementedError("Resume functionality requires checkpointer integration")
+        logger.info(
+            "Resuming agent",
+            session_id=str(session_id),
+            approval=approval,
+            has_user_input=user_input is not None,
+        )
+
+        # Retrieve the checkpointed state
+        config = {"configurable": {"thread_id": str(session_id)}}
+
+        try:
+            # Get the checkpoint tuple from the checkpointer
+            checkpoint_tuple = await self._get_checkpoint(config)
+
+            if checkpoint_tuple is None:
+                raise ValueError(f"No checkpoint found for session {session_id}")
+
+            # Extract state from checkpoint
+            checkpoint = checkpoint_tuple.checkpoint
+            state_data = checkpoint.get("channel_values", {})
+
+            # Reconstruct AgentState from checkpoint data
+            state = self._reconstruct_state(state_data, session_id)
+
+            if state is None:
+                raise ValueError(f"Could not reconstruct state for session {session_id}")
+
+            logger.debug(
+                "Retrieved checkpoint",
+                session_id=str(session_id),
+                phase=state.phase,
+                iteration=state.iteration,
+                awaiting_approval=state.awaiting_human_approval,
+            )
+
+            # Handle approval request if present
+            if state.awaiting_human_approval:
+                if not approval:
+                    # User rejected the pending action
+                    logger.info("User rejected pending action")
+                    state = state.add_error("Action rejected by user")
+                    return state
+
+                # User approved - clear the approval request and continue
+                state = state.grant_approval()
+
+                # Add user input as message if provided
+                if user_input:
+                    user_msg = Message(
+                        role=MessageRole.USER,
+                        content=user_input,
+                    )
+                    state = state.add_message(user_msg)
+
+            # Continue execution from the current state
+            logger.info("Continuing execution from checkpoint")
+            final_state = await self._graph(state)
+
+            logger.info(
+                "Resume completed",
+                phase=final_state.phase,
+                iterations=final_state.iteration,
+            )
+
+            return final_state
+
+        except Exception as e:
+            logger.error("Resume failed", error=str(e), session_id=str(session_id))
+            raise
+
+    async def _get_checkpoint(self, config: dict[str, Any]) -> Any:
+        """
+        Retrieve checkpoint from the checkpointer.
+
+        Handles both sync and async checkpointers.
+        """
+        try:
+            # Try async get first
+            if hasattr(self.checkpointer, "aget_tuple"):
+                return await self.checkpointer.aget_tuple(config)
+            elif hasattr(self.checkpointer, "get_tuple"):
+                # Sync checkpointer
+                return self.checkpointer.get_tuple(config)
+            else:
+                logger.warning("Checkpointer does not support tuple retrieval")
+                return None
+        except Exception as e:
+            logger.error("Checkpoint retrieval failed", error=str(e))
+            return None
+
+    def _reconstruct_state(
+        self, state_data: dict[str, Any], session_id: UUID
+    ) -> AgentState | None:
+        """
+        Reconstruct AgentState from checkpoint data.
+
+        Args:
+            state_data: Raw state data from checkpoint
+            session_id: The session ID for this state
+
+        Returns:
+            Reconstructed AgentState or None if failed
+        """
+        try:
+            # If state_data is already an AgentState, return it
+            if isinstance(state_data, AgentState):
+                return state_data
+
+            # If it's a dict with an AgentState under a key
+            if isinstance(state_data, dict):
+                # Common patterns for stored state
+                for key in ["state", "__root__", "agent_state", ""]:
+                    if key in state_data:
+                        value = state_data[key]
+                        if isinstance(value, AgentState):
+                            return value
+                        if isinstance(value, dict):
+                            try:
+                                return AgentState(**value)
+                            except Exception:
+                                continue
+
+                # Try to construct directly from state_data
+                try:
+                    # Ensure session_id is set
+                    if "session_id" not in state_data:
+                        state_data["session_id"] = session_id
+                    return AgentState(**state_data)
+                except Exception:
+                    pass
+
+            logger.warning("Could not reconstruct state from checkpoint data")
+            return None
+
+        except Exception as e:
+            logger.error("State reconstruction failed", error=str(e))
+            return None
+
+    async def get_session_state(self, session_id: UUID) -> AgentState | None:
+        """
+        Get the current state of a session without resuming.
+
+        Args:
+            session_id: The session to check
+
+        Returns:
+            Current AgentState or None if not found
+        """
+        config = {"configurable": {"thread_id": str(session_id)}}
+        checkpoint_tuple = await self._get_checkpoint(config)
+
+        if checkpoint_tuple is None:
+            return None
+
+        checkpoint = checkpoint_tuple.checkpoint
+        state_data = checkpoint.get("channel_values", {})
+
+        return self._reconstruct_state(state_data, session_id)
+
+    def is_session_paused(self, state: AgentState) -> bool:
+        """Check if a session is paused awaiting approval."""
+        return state.awaiting_human_approval
 
     def register_tool(self, tool: Any) -> None:
         """Register a new tool with the agent."""
