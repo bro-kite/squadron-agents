@@ -1,6 +1,6 @@
 ---
 date created: 2025-12-11
-date updated: 2025-12-11 14:20 UTC
+date updated: 2025-12-28 16:40 UTC
 ---
 
 <div align="center">
@@ -9,7 +9,7 @@ date updated: 2025-12-11 14:20 UTC
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-115%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-192%20passing-brightgreen.svg)]()
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 **"Inference-Time Compute over Pre-Training Scale"**
@@ -41,9 +41,12 @@ The framework is built as a layered modular system:
 ## Key Features
 
 - **Any LLM Provider**: OpenAI, Anthropic, Ollama, Hugging Face, or any OpenAI-compatible API (vLLM, DigitalOcean, RunPod, etc.)
+- **Agent Skills**: Industry-standard modular capabilities following the [Agent Skills](https://github.com/agentskills/agentskills) specification - compatible with Claude, GitHub Copilot, and OpenAI Codex
+- **LLM-Powered Reasoning**: Intelligent action generation and task completion detection using LLM evaluation
 - **Temporal Memory**: Knowledge graph that tracks facts over time and invalidates outdated information
-- **Tree Search Reasoning**: MCTS-based planning with backtracking for complex problem solving
+- **Tree Search Reasoning**: Full MCTS-based planning with LLM-powered expand/simulate functions
 - **List-Wise Verification**: Superior plan selection through comparative ranking
+- **Resume Capability**: Interrupt and resume agent execution with human-in-the-loop approval
 - **MCP Integration**: Universal tool connectivity via Model Context Protocol
 - **A2A Protocol**: Multi-agent coordination and task delegation
 - **Self-Evolution**: Agents that improve their own code and prompts
@@ -146,6 +149,57 @@ result = await agent.delegate(
 )
 ```
 
+### Using Agent Skills
+
+Agent Skills are modular capabilities that follow the [Agent Skills](https://github.com/agentskills/agentskills) open standard. Skills work across Claude, GitHub Copilot, OpenAI Codex, and Squadron.
+
+```python
+from squadron import Agent, SkillsManager, LATSReasoner
+
+# Initialize skills manager
+skills = SkillsManager(workspace_path="./my-project")
+await skills.discover_skills()  # Finds skills in .github/skills/, .claude/skills/, etc.
+
+# Create reasoner with skills support
+reasoner = LATSReasoner(skills_manager=skills)
+
+# Agent automatically uses relevant skills
+agent = Agent(name="developer", reasoner=reasoner)
+result = await agent.run("Create a PowerPoint presentation")  # Uses pptx skill if available
+```
+
+**Creating a Skill:**
+
+```
+.github/skills/my-skill/
+├── SKILL.md          # Required: metadata + instructions
+├── templates/        # Optional: code templates
+└── examples/         # Optional: usage examples
+```
+
+```yaml
+# SKILL.md
+---
+name: my-skill
+description: What this skill does and when to use it
+tags: [python, testing]
+---
+# My Skill
+
+## Instructions
+When performing this task:
+1. Step one
+2. Step two
+
+## Examples
+- Example usage here
+```
+
+Skills use **progressive disclosure** - only relevant content loads into context:
+- **Level 1**: Name/description always loaded (for discovery)
+- **Level 2**: Full instructions loaded when skill is triggered
+- **Level 3**: Resources loaded on-demand
+
 ### Self-Improvement with SICA
 
 ```python
@@ -236,16 +290,20 @@ print(response.content)
 squadron/
 ├── src/squadron/
 │   ├── core/           # L0: Runtime & orchestration
-│   │   ├── agent.py    # Main Agent class
+│   │   ├── agent.py    # Main Agent class (with resume support)
 │   │   ├── config.py   # Configuration management
 │   │   └── state.py    # Immutable state objects
 │   ├── memory/         # L1: Temporal knowledge graph
 │   │   ├── graphiti.py # Graphiti integration
 │   │   └── types.py    # Entity, Edge, Fact types
 │   ├── reasoning/      # L2: LATS & MCTS implementation
-│   │   ├── lats.py     # Language Agent Tree Search
+│   │   ├── lats.py     # Language Agent Tree Search (LLM-powered)
 │   │   ├── mcts.py     # Monte Carlo Tree Search
 │   │   └── verifier.py # List-wise verification
+│   ├── skills/         # Agent Skills (agentskills.io standard)
+│   │   ├── manager.py  # SkillsManager with progressive disclosure
+│   │   ├── models.py   # Skill, SkillMetadata data classes
+│   │   └── parser.py   # SKILL.md parser
 │   ├── connectivity/   # L3: MCP & A2A protocols
 │   │   ├── mcp_host.py # MCP server management
 │   │   ├── mcp_client.py # Remote MCP client
@@ -306,6 +364,15 @@ SERPER_API_KEY=your-key
 # Reasoning
 REASONING_N_CANDIDATES=5
 REASONING_MAX_DEPTH=10
+REASONING_USE_LLM_GENERATION=true
+REASONING_USE_LLM_COMPLETION=true
+REASONING_COMPLETION_CONFIDENCE=0.8
+
+# Agent Skills
+SKILLS_ENABLED=true
+SKILLS_MAX_IN_CONTEXT=5
+SKILLS_RELEVANCE_THRESHOLD=0.2
+SKILLS_AUTO_DISCOVER=true
 
 # Governance
 GOVERNANCE_ENABLE_GUARDRAILS=true
@@ -383,6 +450,8 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 ## Roadmap
 
+- [x] **v0.1.1**: LLM-powered reasoning (action generation, completion detection)
+- [x] **v0.1.2**: Agent Skills support (agentskills.io standard)
 - [ ] **v0.2**: Enhanced memory with vector search
 - [ ] **v0.3**: Distributed agent execution
 - [ ] **v0.4**: Visual reasoning capabilities
@@ -396,6 +465,7 @@ Squadron builds on the shoulders of giants:
 - [Graphiti](https://github.com/getzep/graphiti) - Temporal knowledge graphs
 - [DeepEval](https://github.com/confident-ai/deepeval) - LLM evaluation
 - [MCP](https://modelcontextprotocol.io/) - Model Context Protocol
+- [Agent Skills](https://github.com/agentskills/agentskills) - Open standard for agent capabilities
 
 
 ## License
