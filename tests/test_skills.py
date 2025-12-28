@@ -299,6 +299,39 @@ class TestSkillsManager:
             
             assert count == 0
             assert manager.get_skills_summary() == "No skills available."
+    
+    @pytest.mark.asyncio
+    async def test_find_skills_uses_loaded_cache(self, temp_skills_dir):
+        """Test that find_skills returns loaded skills with instructions."""
+        manager = SkillsManager(workspace_path=temp_skills_dir)
+        await manager.discover_skills()
+        
+        # Load a skill first
+        loaded_skill = await manager.load_skill("python-testing")
+        assert loaded_skill is not None
+        assert loaded_skill.is_loaded
+        
+        # Now find_skills should return the loaded version
+        matches = manager.find_skills("python testing")
+        python_match = next((m for m in matches if m.skill.name == "python-testing"), None)
+        
+        assert python_match is not None
+        assert python_match.skill.is_loaded  # Should have instructions
+        assert python_match.skill.instructions is not None
+    
+    @pytest.mark.asyncio
+    async def test_path_traversal_blocked(self, temp_skills_dir):
+        """Test that path traversal attempts are blocked."""
+        manager = SkillsManager(workspace_path=temp_skills_dir)
+        await manager.discover_skills()
+        
+        # Try to load a resource with path traversal
+        content = await manager.load_skill_resource("web-scraping", "../../../etc/passwd")
+        assert content is None
+        
+        # Try another traversal pattern
+        content = await manager.load_skill_resource("web-scraping", "../../python-testing/SKILL.md")
+        assert content is None
 
 
 # ============================================================================

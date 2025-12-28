@@ -145,11 +145,14 @@ class SkillsManager:
         for name, metadata in self._metadata_index.items():
             score = metadata.matches_query(query)
             if score >= threshold:
-                # Create a lightweight Skill object (not fully loaded)
-                skill = Skill(
-                    metadata=metadata,
-                    path=self._skill_paths[name].parent,
-                )
+                # Use cached loaded skill if available, otherwise create lightweight object
+                if name in self._loaded_skills:
+                    skill = self._loaded_skills[name]
+                else:
+                    skill = Skill(
+                        metadata=metadata,
+                        path=self._skill_paths[name].parent,
+                    )
                 matches.append(SkillMatch(skill=skill, score=score))
         
         # Sort by score descending
@@ -208,8 +211,18 @@ class SkillsManager:
         if resource_path in skill.resources:
             return skill.resources[resource_path]
         
-        # Load from disk
-        full_path = skill.path / resource_path
+        # Security: Validate path to prevent traversal attacks
+        full_path = (skill.path / resource_path).resolve()
+        skill_path_resolved = skill.path.resolve()
+        
+        if not full_path.is_relative_to(skill_path_resolved):
+            logger.warning(
+                "Path traversal attempt blocked",
+                skill=skill_name,
+                resource=resource_path,
+            )
+            return None
+        
         if not full_path.exists():
             logger.warning(
                 "Skill resource not found",
