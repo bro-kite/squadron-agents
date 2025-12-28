@@ -24,10 +24,18 @@ from squadron.reasoning.verifier import ListWiseVerifier, CandidatePlan
 from squadron.core.config import ReasoningConfig
 from squadron.llm.base import LLMProvider, LLMMessage, ToolDefinition
 
+# Import skills (optional dependency)
+try:
+    from squadron.skills.manager import SkillsManager
+    SKILLS_AVAILABLE = True
+except ImportError:
+    SKILLS_AVAILABLE = False
+    SkillsManager = None
+
 logger = structlog.get_logger(__name__)
 
 
-# Prompt template for LLM-based action generation
+# Prompt template for LLM-based action generation (with skills support)
 ACTION_GENERATION_PROMPT = '''You are an expert AI agent planning assistant. Your task is to generate candidate actions for accomplishing the given task.
 
 ## Current Task
@@ -35,7 +43,7 @@ ACTION_GENERATION_PROMPT = '''You are an expert AI agent planning assistant. You
 
 ## Available Tools
 {tools}
-
+{skills_section}
 ## Conversation History
 {history}
 
@@ -97,6 +105,7 @@ class LATSReasoner:
         verifier: ListWiseVerifier | None = None,
         default_tool: str | None = None,
         tool_args_fn: Callable[[AgentState], dict[str, Any]] | None = None,
+        skills_manager: Any | None = None,
     ) -> None:
         """
         Initialize the LATS reasoner.
@@ -109,6 +118,7 @@ class LATSReasoner:
             verifier: ListWiseVerifier for ranking candidates
             default_tool: Fallback tool when LLM is unavailable
             tool_args_fn: Function to derive tool arguments from state
+            skills_manager: SkillsManager for Agent Skills support
         """
         self.config = config or ReasoningConfig()
         self.llm = llm
@@ -118,6 +128,8 @@ class LATSReasoner:
         self.default_tool = default_tool
         # Function to derive tool arguments from state; falls back to {"text": task}
         self.tool_args_fn = tool_args_fn
+        # Agent Skills support
+        self.skills_manager = skills_manager
 
         # Placeholder MCTS controller – ready for richer policies later
         self.mcts = MCTSController(
@@ -216,6 +228,7 @@ class LATSReasoner:
 
         Uses the ACTION_GENERATION_PROMPT to ask the LLM to propose
         multiple candidate actions based on the current state and available tools.
+        Includes relevant Agent Skills context when available.
         """
         # Format available tools for the prompt
         tools_text = self._format_tools_for_prompt()
@@ -226,10 +239,14 @@ class LATSReasoner:
         # Format memory context
         context_text = self._format_context(state.memory_context)
 
+        # Format skills context (if available)
+        skills_text = self._format_skills_for_prompt(state.task)
+
         # Build the prompt
         prompt = ACTION_GENERATION_PROMPT.format(
             task=state.task,
             tools=tools_text,
+            skills_section=skills_text,
             history=history_text,
             context=context_text,
             n_candidates=self.config.n_candidates,
@@ -311,6 +328,60 @@ class LATSReasoner:
             lines.append(f"- {key}: {value_str}")
 
         return "\n".join(lines)
+
+    def _format_skills_for_prompt(self, task: str) -> str:
+        """
+        Format relevant Agent Skills for inclusion in the prompt.
+        
+        Uses progressive disclosure - only includes skills relevant to the task.
+        """
+        if not self.skills_manager:
+            return ""
+        
+        try:
+            # Find skills relevant to the task
+            matches = self.skills_manager.find_skills(task, threshold=0.2)
+            
+            if not matches:
+                return ""
+            
+            lines = ["\n## Relevant Skills"]
+            lines.append("The following skills may help with this task:\n")
+            
+            for match in matches:
+                skill = match.skill
+                lines.append(f"### {skill.name}")
+                lines.append(f"**Description**: {skill.description}")
+                
+                # Include instructions if skill is loaded
+                if skill.is_loaded and skill.instructions:
+                    # Truncate long instructions
+                    instructions = skill.instructions[:1000]
+                    if len(skill.instructions) > 1000:
+                        instructions += "\n... (truncated)"
+                    lines.append(f"\n**Instructions**:\n{instructions}")
+                
+                lines.append("")
+            
+            logger.debug(
+                "Added skills context to prompt",
+                num_skills=len(matches),
+                skills=[m.skill.name for m in matches],
+            )
+            
+            return "\n".join(lines) + "\n"
+            
+        except Exception as e:
+            logger.warning("Failed to format skills for prompt", error=str(e))
+            return ""
+
+    def set_skills_manager(self, skills_manager: Any) -> None:
+        """Set the Skills Manager for Agent Skills support."""
+        self.skills_manager = skills_manager
+        logger.info(
+            "Set SkillsManager for LATS",
+            skill_count=skills_manager.skill_count if skills_manager else 0,
+        )
 
     def _parse_llm_candidates(self, content: str) -> list[CandidatePlan]:
         """Parse LLM response into CandidatePlan objects."""

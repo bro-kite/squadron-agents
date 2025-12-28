@@ -184,6 +184,42 @@ class GovernanceConfig(BaseSettings):
     )
 
 
+class SkillsConfig(BaseSettings):
+    """Configuration for Agent Skills support."""
+
+    model_config = SettingsConfigDict(env_prefix="SKILLS_")
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable Agent Skills support",
+    )
+    directories: list[str] = Field(
+        default_factory=lambda: [
+            ".github/skills",
+            ".claude/skills",
+            ".squadron/skills",
+            "skills",
+        ],
+        description="Directories to search for skills (relative to workspace)",
+    )
+    max_skills_in_context: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum skills to include in LLM context",
+    )
+    relevance_threshold: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description="Minimum relevance score to include a skill",
+    )
+    auto_discover: bool = Field(
+        default=True,
+        description="Automatically discover skills on agent initialization",
+    )
+
+
 class EvolutionConfig(BaseSettings):
     """Configuration for self-improvement system."""
 
@@ -240,6 +276,7 @@ class SquadronConfig(BaseSettings):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     governance: GovernanceConfig = Field(default_factory=GovernanceConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
